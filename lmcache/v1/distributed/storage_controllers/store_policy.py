@@ -10,6 +10,7 @@ The store policy makes two decisions after data is written to L1:
 # Standard
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+import hashlib
 
 # First Party
 from lmcache.v1.distributed.api import ObjectKey
@@ -211,3 +212,97 @@ class BufferOnlyStorePolicy(DefaultStorePolicy):
 
 register_store_policy("default", DefaultStorePolicy)
 register_store_policy("skip_l1", BufferOnlyStorePolicy)
+
+
+class StripedStorePolicy(StorePolicy):
+    """Striped store policy: distribute keys across adapters by hash.
+
+    Each key is assigned to exactly one adapter via an MD5-based
+    hash of the key, i.e. ``md5(str(key)) % len(adapters)``, spreading write (and read) pressure evenly across
+    multiple SSDs.  Unlike :class:`DefaultStorePolicy` which mirrors
+    every key to every adapter, this policy stores each key only once,
+    sacrificing redundancy for throughput and capacity.
+
+    Pair with multiple ``--l2-adapter`` instances pointing to different
+    SSD paths and ``--l2-store-policy striped`` to enable.
+
+    The matching prefetch policy (:class:`DefaultPrefetchPolicy`) already
+    picks the first adapter that has a key, so no prefetch-side change
+    is needed — under striped storage exactly one adapter has any given
+    key.
+    """
+
+    @staticmethod
+    def _adapter_index_for_key(
+        key: ObjectKey,
+        num_adapters: int,
+    ) -> int:
+        """Deterministically pick an adapter index for *key*.
+
+        Uses MD5 on the key's string representation for a deterministic,
+        cross-process-stable hash.  Python's built-in ``hash()`` is
+        randomized per process via ``PYTHONHASHSEED`` (Python 3.3+), so
+        it would route the same key to different adapters after a server
+        restart — orphaning persistent L2 data.
+
+        MD5 is sufficient here: we need uniform distribution, not
+        cryptographic security, and it avoids the ``blake3`` dependency.
+
+        Args:
+            key: The object key to route.
+            num_adapters: Number of available adapters.
+
+        Returns:
+            Adapter index in ``[0, num_adapters)``.
+        """
+        h = hashlib.md5(str(key).encode())
+        return int.from_bytes(h.digest()[:8], "big") % num_adapters
+
+    def select_store_targets(
+        self,
+        keys: list[ObjectKey],
+        adapters: list[AdapterDescriptor],
+    ) -> dict[int, list[ObjectKey]]:
+        """Assign each key to exactly one adapter via hash-based striping.
+
+        Args:
+            keys: Keys that were just written to L1.
+            adapters: Descriptors of available L2 adapters.
+
+        Returns:
+            Mapping from adapter index to the list of keys assigned to
+            that adapter. Each key appears in exactly one adapter's
+            list. If ``adapters`` is empty, returns an empty dict (no
+            L2 storage).
+        """
+        if not adapters:
+            return {}
+
+        num_adapters = len(adapters)
+        # Pre-sort by index for deterministic modulo mapping
+        sorted_adapters = sorted(adapters, key=lambda a: a.index)
+        result: dict[int, list[ObjectKey]] = {ad.index: [] for ad in sorted_adapters}
+
+        for key in keys:
+            slot = self._adapter_index_for_key(key, num_adapters)
+            adapter_id = sorted_adapters[slot].index
+            result[adapter_id].append(key)
+
+        return result
+
+    def select_l1_deletions(
+        self,
+        keys: list[ObjectKey],
+    ) -> list[ObjectKey]:
+        """Never delete from L1 (same as DefaultStorePolicy).
+
+        Args:
+            keys: Keys that were successfully stored to L2.
+
+        Returns:
+            Empty list (keep all keys in L1).
+        """
+        return []
+
+
+register_store_policy("striped", StripedStorePolicy)
